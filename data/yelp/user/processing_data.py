@@ -192,11 +192,10 @@ def sanity_check_zones(poi_ids, coords, poi2zone, reviews, hyperedges, cold_thre
 hyperedges = []
 train_hyperedges = []
 test_hyperedges = []
-
+# 加载全部 poi
+poi_infos = {}
 # 构建超边
 def build_hyperedge(poi_path, user_path, zone_path):
-    # 加载全部 poi
-    poi_infos = {}
     with open(poi_path, 'r', encoding='utf-8') as f:
         for f_poi in f:
             poi = json.loads(f_poi)
@@ -319,24 +318,36 @@ De_inv[torch.isinf(De_inv)] = 0
 # Step 3: BPR Training
 # --------------------------
 
-def bpr_loss(user_emb, pos_emb, neg_emb_list, reg_weight=1e-4):
+def bpr_loss_batch(user_emb, pos_emb, neg_embs, reg_weight=1e-4):
 
     # user_emb: [1, emb_dim], pos_emb: [1, emb_dim], neg_emb_list: [num_neg, emb_dim]
-    pos_score = (user_emb * pos_emb).sum(dim=1)
+
     # logging.info(pos_score.shape)
     # 广播 做点积
     # logging.info((user_emb * neg_emb_list).sum(dim=1))
     # logging.info((user_emb * neg_emb_list).sum(dim=1,  keepdim = True ))
-    neg_score = (user_emb * neg_emb_list).sum(dim=1)
-    # 基础 BPR
+    """
+        矩阵化 BPR 损失
+        user_emb: [batch, dim]
+        pos_emb:  [batch, dim]
+        neg_embs: [batch, num_neg, dim]
+        """
+    # 1. 计算正样本得分 (点积)
+    pos_score = (user_emb * pos_emb).sum(dim=1, keepdim=True)  # [batch, 1]
+
+    # 2. 计算负样本得分 (批量矩阵乘法)
+    # [batch, num_neg, dim] @ [batch, dim, 1] -> [batch, num_neg, 1]
+    neg_score = torch.bmm(neg_embs, user_emb.unsqueeze(2)).squeeze(2)  # [batch, num_neg]
+
+    # 3. 核心 BPR 公式: 推大正负得分差
+    # 广播机制会让 pos_score 对齐每个 neg_score
     loss = -torch.log(torch.sigmoid(pos_score - neg_score) + 1e-8).mean()
 
-    # L2 正则化：惩罚过大的 Embedding
+    # 4. L2 正则化
     reg_loss = reg_weight * (user_emb.norm(2).pow(2) +
                              pos_emb.norm(2).pow(2) +
-                             neg_emb_list.norm(2).pow(2))
+                             neg_embs.norm(2).pow(2))
     return loss + reg_loss
-
 # def sample_negatives(user_idx, num_neg, poi_ids):
 #     # 移除用户训练集中已访问的 poi
 #     candidate = list(set(poi_ids.tolist()) - user_poi_dict[user_idx])
@@ -362,6 +373,14 @@ def bpr_loss(user_emb, pos_emb, neg_emb_list, reg_weight=1e-4):
 
 
 def sample_negatives(user_idx, num_neg, poi_ids, X):
+    """
+
+    :param user_idx:
+    :param num_neg: 每条正样本采 多少个负样本
+    :param poi_ids:
+    :param X:
+    :return:
+    """
     # 1. 过滤掉已访问的
     candidate_set = list(set(poi_ids.tolist()) - user_poi_dict[user_idx])
 
@@ -388,6 +407,35 @@ def sample_negatives(user_idx, num_neg, poi_ids, X):
     return hard_samples + rand_samples
 
 
+def sample_negatives_batch(user_idx_tensor, num_neg, poi_ids, X):
+    """
+
+    :param user_idx:
+    :param num_neg: 每条正样本采 多少个负样本
+    :param poi_ids: 地点: id
+    :param X:
+    :return:
+   """
+    negatives_samples_list = []
+    for user_idx in user_idx_tensor:
+        negatives_samples_list.append(sample_negatives(user_idx, num_neg, poi_ids, X))
+
+    return negatives_samples_list
+
+def sample_negatives_gpu(u_idx, num_neg, poi_ids, X_snapshot):
+    # 1. GPU 随机采 100 个候选点
+    cand_indices = torch.randint(0, len(poi_ids), (u_idx.size(0), 100), device=u_idx.device)
+    cand_poi_ids = poi_ids[cand_indices]
+
+    # 2. 计算候选点得分 (用无梯度的快照 X_snapshot)
+    u_emb = X_snapshot[u_idx].unsqueeze(1)
+    cand_emb = X_snapshot[cand_poi_ids]
+    scores = torch.bmm(u_emb, cand_emb.transpose(1, 2)).squeeze(1)
+
+    # 3. 选出最难的 num_neg 个负样本 ID
+    _, hard_idx = scores.topk(num_neg, dim=1)
+    final_neg_ids = torch.gather(cand_poi_ids, 1, hard_idx)
+    return final_neg_ids
 user_nodes = [n for n in all_nodes if n.startswith('user_')]
 user_ids = torch.tensor([node2id[n] for n in user_nodes])
 
@@ -464,7 +512,15 @@ embed_dim = 128
 # # 创建模型对象
 # hgc = HypergraphConv(embed_dim, embed_dim)
 # optimizer = optim.Adam(list(hgc.parameters()) + list(X0.parameters()), lr=0.01)
-model = HyperGraphModel(len(all_nodes), embed_dim, all_nodes)
+
+# 预准备权重矩阵
+#init_weights = torch.load('semantic_init.pt')
+
+init_weights = torch.randn(len(all_nodes), embed_dim) # 但是！你又随手造了一个随机矩阵
+
+
+# 然后再初始化模型
+model = HyperGraphModel(len(all_nodes), embed_dim, all_nodes, init_weights=init_weights)
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
 num_epochs = 1000
@@ -475,51 +531,83 @@ patience = 20
 wait = 0
 
 batch_size = 512 # 小数据集用 512，全量数据集可以用 1024 或 2048
-num_batches = (len(user_pos_pairs) + batch_size - 1)
+num_batches = (len(user_pos_pairs) + batch_size - 1) // batch_size
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# 将模型和参数移动到 GPU
+model = model.to(device)
+H = H.to(device)
+Dv_inv_sqrt = Dv_inv_sqrt.to(device)
+De_inv = De_inv.to(device)
+# 总节点数：1933，超边 2768
 for epoch in range(num_epochs):
     model.train()
-    # X = hgc.forward(X0.weight, H, Dv_inv_sqrt, De_inv)
-    # 全图卷积：一轮只算一次
-    X = model(H, Dv_inv_sqrt, De_inv)
     random.shuffle(user_pos_pairs)
-    epoch_loss = 0
+    # --- 重点：每轮开始前，先拿一个不带梯度的全局快照 ---
+    with torch.no_grad():
+        X_snapshot = model(H, Dv_inv_sqrt, De_inv).detach()
+    epoch_loss = 0.0
+
     for b in range(num_batches):
-        # 清空上一次计算的梯度
-        optimizer.zero_grad()
-        optimizer.zero_grad()
         start = b * batch_size
         end = min(start + batch_size, len(user_pos_pairs))
         batch_data = user_pos_pairs[start:end]
-        u_idx = torch.tensor([p[0] for p in batch_data])
-        pos_idx = torch.tensor([p[1] for p in batch_data])
-        # 3. 批量负采样
-        neg_idx = sample_negatives_batch(u_idx, num_neg, X)
 
+        if len(batch_data) == 0:
+            continue
 
-    losses = []
-    for user_idx, pos_idx in user_pos_pairs:
-        user_vec = X[user_idx].unsqueeze(0) # [1, embed_dim]
-        pos_vec = X[pos_idx].unsqueeze(0)
-        #  pos_idx 是 nodeId 里面的索引。
+        optimizer.zero_grad()
 
-        neg_idx_batch = torch.tensor(sample_negatives(user_idx, num_neg, poi_ids, X))
-        # logging.info(f"{[id2node[idx.item()] for idx in neg_idx_batch]}")
-        loss = bpr_loss(user_vec, pos_vec, X[neg_idx_batch])
-        losses.append(loss)
-    loss = torch.stack(losses).mean()
-    loss.backward()
-    optimizer.step()
+        # forward
+        X = model(H, Dv_inv_sqrt, De_inv)  # 全图卷积
+        X = X.to(device)
+
+        # 批量索引
+        u_idx = torch.tensor([p[0] for p in batch_data], device=device)
+        pos_idx = torch.tensor([p[1] for p in batch_data], device=device)
+
+        # 多负采样：批量生成负样本
+        neg_idx = sample_negatives_gpu(u_idx, num_neg, poi_ids, X_snapshot)
+
+        # 批量 embedding
+        user_vecs = X[u_idx]                 # [batch, emb_dim]
+        pos_vecs  = X[pos_idx]               # [batch, emb_dim]
+        neg_vecs  = X[neg_idx]               # [batch, num_neg, emb_dim]
+
+        # 计算 BPR loss
+        loss = bpr_loss_batch(user_vecs, pos_vecs, neg_vecs)
+        loss.backward()
+        optimizer.step()
+
+        epoch_loss += loss.item()
+        # 及时释放 GPU 内存
+
+        del user_vecs, pos_vecs, neg_vecs, u_idx, pos_idx, neg_idx
+
+        torch.cuda.empty_cache()
+
     scheduler.step()
+    epoch_loss /= num_batches
+
+    # ------------------------
+    # 评估阶段
+    # ------------------------
     if epoch % 5 == 0:
-        recall = evaluate(test_hyperedges, X, node2id, topk=topk)
-        recall_20 = evaluate(test_hyperedges, X, node2id, topk=20)
-        recall_50 = evaluate(test_hyperedges, X, node2id, topk=50)
+        model.eval()
+        with torch.no_grad():
+            X_eval = model(H, Dv_inv_sqrt, De_inv).to(device)
+            recall = evaluate(test_hyperedges, X_eval, node2id, topk=topk)
+            recall_20 = evaluate(test_hyperedges, X_eval, node2id, topk=20)
+            recall_50 = evaluate(test_hyperedges, X_eval, node2id, topk=50)
 
-        logging.info(f"Epoch {epoch} - BPR Loss: {loss.item():.4f}, Recall@{topk}: {recall:.4f}")
-        logging.info(f"Epoch {epoch} - BPR Loss: {loss.item():.4f}, Recall@{20}: {recall_20:.4f}")
-        logging.info(f"Epoch {epoch} - BPR Loss: {loss.item():.4f}, Recall@{50}: {recall_50:.4f}")
+        logging.info(
+            f"Epoch {epoch} | Loss {epoch_loss:.4f} | "
+            f"R@{topk} {recall:.4f} | "
+            f"R@20 {recall_20:.4f} | R@50 {recall_50:.4f}"
+        )
 
+        # early stopping
         if recall > best_recall:
             best_recall = recall
             wait = 0
@@ -528,4 +616,5 @@ for epoch in range(num_epochs):
             if wait >= patience:
                 logging.info("Early stopping")
                 break
+
 

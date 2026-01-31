@@ -3,9 +3,13 @@ import torch.nn.functional as F
 from exp.model.gnn.HyperGraphConv import HypergraphConv
 
 class HyperGraphModel(torch.nn.Module):
-    def __init__(self, num_nodes, emb_dim, all_nodes):
+    def __init__(self, num_nodes, emb_dim, all_nodes, init_weights=None):
         super().__init__()
-        self.embedding = torch.nn.Embedding(num_nodes, emb_dim)
+        # --- 修改点 1: 支持外部语义权重注入 ---
+        if init_weights is not None:
+            self.embedding = torch.nn.Embedding.from_pretrained(init_weights, freeze=False)
+        else:
+            self.embedding = torch.nn.Embedding(num_nodes, emb_dim)
 
         # 预先计算节点类型掩码
         self.node_types = ['user_', 'poi_', 'attr_', 'time_', 'zone_']
