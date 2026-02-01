@@ -6,10 +6,11 @@ import random
 from typing import Dict, List, Tuple, Set
 
 import torch
+import torch.nn.functional as F
 from torch import nn, optim
 
-from exp.config import YELP_DATA_REVIEW, YELP_DATA_USER
-from exp.model.gnn.HyperGraphConv import HypergraphConv
+from exp.config import YELP_DATA_REVIEW, YELP_DATA_USER, YELP_DATA_BUSINESS_WSL
+
 from exp.model.gnn.HyperGraphModel import HyperGraphModel
 
 '''
@@ -72,7 +73,7 @@ def build_spatial_node(poi_path, K=50, output_name='zone_node.json'):
 
         zone_labels = kmeans.fit_predict(coords)
         zone_map = {}
-        with open(output_name, "w") as f:
+        with open(output_name, "w",encoding='utf-8') as f:
             for poi_id, z in zip(poi_ids, zone_labels):
                 zone_map[poi_id] = f"zone_{z}"
 
@@ -203,18 +204,18 @@ def build_hyperedge(poi_path, user_path, zone_path):
 
     # 加载全部地区节点
     zone_nodes = {}
-    with open(zone_path, 'r') as f:
+    with open(zone_path, 'r',encoding='utf-8') as f:
         zone_nodes = json.load(f)
 
     sorted_pois = []
-    with open(user_path, mode='r') as f:
+    with open(user_path, mode='r',encoding='utf-8') as f:
         for u_line in f:
             user = json.loads(u_line)
             poi_list = user.get('poi')
             #logging.info(f"{ user.get('user_id')}：访问过{len(poi_list)}个地点")
             for poi in poi_list:
                 sorted_pois.append(poi)
-    with open(user_path, mode='r') as f:
+    with open(user_path, mode='r',encoding='utf-8') as f:
         for u_line in f:
             user = json.loads(u_line)
             user_id = user.get('user_id')
@@ -248,7 +249,7 @@ def build_hyperedge(poi_path, user_path, zone_path):
 
 # build_spatial_node(YELP_DATA_REVIEW / 'reviewed_business.jsonl', K=50, output_name = 'zone_node.json')
 
-build_hyperedge(YELP_DATA_REVIEW / 'reviewed_business.jsonl',
+build_hyperedge(YELP_DATA_BUSINESS_WSL / 'reviewed_business.jsonl',
                 YELP_DATA_USER / 'user_interest.jsonl',
                 'zone_node.json')
 
@@ -267,7 +268,8 @@ logging.info(f"总节点数：{len(all_nodes)}")
 # 节点编号
 node2id = {node: idx for idx, node in enumerate(all_nodes)}
 id2node = {idx: node for node, idx in node2id.items()}
-
+with open('id2node.json', 'w',encoding='utf-8') as f:
+    json.dump(id2node, f)
 # 超边编号
 edge2id = {idx: idx for idx in range(len(train_hyperedges))}
 
@@ -461,7 +463,9 @@ for edge in train_hyperedges:
     user_pos_pairs.append((user_idx, poi_idx))
     user_poi_dict[user_idx].add(poi_idx)
 
-random.shuffle(user_pos_pairs)
+with open('user_pos_pairs.json', 'w',encoding='utf-8') as f:
+    json.dump(user_pos_pairs, f)
+
 logging.info(f"训练集数量：{len(user_pos_pairs)}" )
 logging.info(f"示例前10条：{user_pos_pairs[:10]}")
 
@@ -506,27 +510,55 @@ def evaluate(test_hyperedges, X, node2id, topk=10):
     recall = hits / total
     return recall
 
-embed_dim = 128
+
 # # 生成随机初始化矩阵
 # X0 = nn.Embedding(len(all_nodes), embed_dim) # Embedding 对象
 # # 创建模型对象
 # hgc = HypergraphConv(embed_dim, embed_dim)
 # optimizer = optim.Adam(list(hgc.parameters()) + list(X0.parameters()), lr=0.01)
+def cal_contrastive_loss(embeddings, node_masks, temp=0.1):
+    """
+        通过两次带随机扰动（Dropout）的 forward 产生正样本对
+        """
+    # 第一次 forward (带隐式噪声)
+    X1 = model(H, Dv_inv_sqrt, De_inv)
+    # 第二次 forward (带隐式噪声)
+    X2 = model(H, Dv_inv_sqrt, De_inv)
 
+    # 仅对 POI 节点做对比
+    poi_mask = model.get_masks()['poi_']
+    z1 = F.normalize(X1[poi_mask], dim=1)
+    z2 = F.normalize(X2[poi_mask], dim=1)
+
+    # 矩阵计算 InfoNCE
+    pos_score = torch.exp(torch.sum(z1 * z2, dim=1) / temp)
+    all_score = torch.exp(torch.mm(z1, z2.t()) / temp).sum(dim=1)
+
+    loss = -torch.log(pos_score / all_score).mean()
+    return loss
 # 预准备权重矩阵
-#init_weights = torch.load('semantic_init.pt')
+init_weights = torch.load('semantic_init.pt')
 
-init_weights = torch.randn(len(all_nodes), embed_dim) # 但是！你又随手造了一个随机矩阵
+#init_weights = torch.randn(len(all_nodes), embed_dim) # 但是！你又随手造了一个随机矩阵
 
-
+embed_dim = 128
 # 然后再初始化模型
 model = HyperGraphModel(len(all_nodes), embed_dim, all_nodes, init_weights=init_weights)
-optimizer = optim.Adam(model.parameters(), lr=0.001)
-scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
+base_params = [p for n, p in model.named_parameters() if 'fusion_weights' not in n]
+fusion_params = [model.fusion_weights]
+
+optimizer = optim.Adam([
+    {'params': base_params, 'lr': 0.0003},      # 恢复到 0.001，动力更足
+    {'params': fusion_params, 'lr': 0.001}     # 融合权重慢点跑，别跑偏
+], weight_decay=1e-5)
+
+# --- 修改 Scheduler ---
+# 别让学习率降得太快，10 个 epoch 减半太狠了，改成 30 个 epoch 且 gamma=0.8
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.8)
 num_epochs = 1000
 topk = 10
 num_neg = 20  # 每条正样本采5个负样本
-best_recall = 0
+best_recall = 100
 patience = 20
 wait = 0
 
@@ -569,21 +601,34 @@ for epoch in range(num_epochs):
 
         # 多负采样：批量生成负样本
         neg_idx = sample_negatives_gpu(u_idx, num_neg, poi_ids, X_snapshot)
+        # 2. 提取当前 Batch 的推荐向量
+        user_vecs = X[u_idx]
+        pos_vecs = X[pos_idx]
+        # 这里假设 sample_negatives_gpu 已经根据 X_snapshot 算好了 neg_idx
+        neg_vecs = X[neg_idx]
 
-        # 批量 embedding
-        user_vecs = X[u_idx]                 # [batch, emb_dim]
-        pos_vecs  = X[pos_idx]               # [batch, emb_dim]
-        neg_vecs  = X[neg_idx]               # [batch, num_neg, emb_dim]
+        # 3. 计算推荐损失 (BPR Loss)
+        # 统一使用一个变量名，比如 loss_rec
+        loss_rec = bpr_loss_batch(user_vecs, pos_vecs, neg_vecs)
 
-        # 计算 BPR loss
-        loss = bpr_loss_batch(user_vecs, pos_vecs, neg_vecs)
-        loss.backward()
+        # 4. 计算对比学习损失 (CL Loss)
+        # 获取节点掩码
+        masks = model.get_masks()
+        loss_cl = cal_contrastive_loss(X, masks, temp=0.15)
+
+        # 5. 联合优化 (关键点)
+        # lambda 系数建议设为 0.01 到 0.1 之间
+        cl_lambda = 0.002
+        total_loss = loss_rec + cl_lambda * loss_cl
+
+        # 6. Backward
+        total_loss.backward()
         optimizer.step()
 
-        epoch_loss += loss.item()
-        # 及时释放 GPU 内存
+        epoch_loss += total_loss.item()
 
-        del user_vecs, pos_vecs, neg_vecs, u_idx, pos_idx, neg_idx
+        # 及时释放内存（注意：empty_cache 会大幅拖慢速度，建议只在内存极度紧张时使用）
+        del user_vecs, pos_vecs, neg_vecs
 
         torch.cuda.empty_cache()
 
@@ -601,6 +646,8 @@ for epoch in range(num_epochs):
             recall_20 = evaluate(test_hyperedges, X_eval, node2id, topk=20)
             recall_50 = evaluate(test_hyperedges, X_eval, node2id, topk=50)
 
+            w = torch.nn.functional.softmax(model.fusion_weights, dim=0)
+            logging.info(f"Fusion Weights: X0={w[0]:.4f}, X1={w[1]:.4f}, X2={w[2]:.4f}")
         logging.info(
             f"Epoch {epoch} | Loss {epoch_loss:.4f} | "
             f"R@{topk} {recall:.4f} | "
@@ -611,6 +658,12 @@ for epoch in range(num_epochs):
         if recall > best_recall:
             best_recall = recall
             wait = 0
+            # 1. 保存模型权重 (State Dict)
+            torch.save(model.state_dict(), 'st_hyperrag_best.pth')
+            # 2. 建议同时保存此时的 Embedding 快照，方便直接对接 LLM
+            torch.save(X_eval, 'best_embeddings.pt')
+
+            logging.info(f"！！！发现更优模型，已保存至 st_hyperrag_best.pth (R@10: {recall:.4f})")
         else:
             wait += 1
             if wait >= patience:

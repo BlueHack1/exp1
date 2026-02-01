@@ -6,4 +6,7 @@
 *.iml
 out
 gen
+*.json*
+*.pt*
 __pycache__
+*.xml

@@ -1,4 +1,4 @@
-from exp.config import YELP_DATA_REVIEW, YELP_DATA_USER
+from exp.config import YELP_DATA_REVIEW, YELP_DATA_USER, YELP_DATA_BUSINESS_WSL
 import json
 import logging
 import numbers
@@ -70,7 +70,7 @@ class HypergraphConstructor:
 
         self.zone_nodes = {pid: f"zone_{z}" for pid, z in zip(poi_ids, zone_labels)}
 
-        with open(output_name, "w") as f:
+        with open(output_name, "w",encoding='utf-8') as f:
             json.dump(self.zone_nodes, f)
         logging.info(f"空间节点构建完毕，共 {self.k_clusters} 个区域")
 
@@ -103,11 +103,11 @@ class HypergraphConstructor:
 
         # 2. 加载或确认 Zone 信息
         if self.zone_path:
-            with open(self.zone_path, 'r') as f:
+            with open(self.zone_path, 'r',encoding='utf-8') as f:
                 self.zone_nodes = json.load(f)
 
         # 3. 处理用户轨迹并构建超边
-        with open(self.user_path, mode='r') as f:
+        with open(self.user_path, mode='r',encoding='utf-8') as f:
             for u_line in f:
                 user = json.loads(u_line)
                 user_id = user.get('user_id')
@@ -148,8 +148,8 @@ class HypergraphConstructor:
         pass
 
 
-hyperedgesCon = HypergraphConstructor(YELP_DATA_REVIEW / 'reviewed_business.jsonl',
+hyperedgesCon = HypergraphConstructor(YELP_DATA_BUSINESS_WSL / 'reviewed_business.jsonl',
                                       YELP_DATA_USER / 'user_interest.jsonl',
                                       'zone_node.json')
 hyperedgesCon.build_hyperedges()
-logging.info(hyperedgesCon.hyperedges)
+logging.info("结束")

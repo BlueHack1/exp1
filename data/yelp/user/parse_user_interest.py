@@ -9,7 +9,7 @@ from exp.config import YELP_DATA_BUSINESS_WSL, YELP_DIR_WSL, YELP_DATA_REVIEW_WS
 
 import json
 
-from model_test.download.interface import Qwen3Stream
+# from model_test.download.interface import Qwen3Stream
 
 '''
     通过用户历史访问地点，构建用户兴趣。
@@ -34,7 +34,7 @@ from model_test.download.interface import Qwen3Stream
 '''
 business_city = {}
 user_interest = {}  # 收集用户 ID
-qwen3 = Qwen3Stream.get_instance()
+# qwen3 = Qwen3Stream.get_instance()
 
 
 def extract():
@@ -51,23 +51,26 @@ def extract():
     with open(YELP_DATA_REVIEW_WSL / "sifted_review.jsonl", "r", encoding="utf-8") as f_in:
         for num, line in enumerate(f_in):
             logging.info(f"正在执行第 {num + 1} 个")
+            logging.info(f"获取 {len(user_interest)} 个")
             review = json.loads(line)
             uid = review.get("user_id")
             business = business_city.get(review.get("business_id"))
             category = business.get("category")
             text = review.get("text")
-            if len(user_interest) >= 1000:
+            if len(user_interest) >= 1000000:
+                # 数量超出，但保证遍历完毕 已存在的用户 的 访问
                 if uid not in user_interest:
                     continue
             if uid:
                 user_interest.setdefault(uid, {'poi': []})
                 pois = user_interest[uid]['poi']
-                # 超出 20 个 poi 不继续筛选了。
-                if len(pois) > 20:
+                # 超出 5 个 poi 不继续筛选了。
+                if len(pois) > 5:
+                    logging.info(f"{uid}:超出50个")
                     continue
                 start = time.perf_counter()
-                pn = sentiment(text, category)
-                logging.info(f"{text}\n获取的结果是：{pn}")
+                # pn = sentiment(text, category)
+                # logging.info(f"{text}\n获取的结果是：{pn}")
                 pois.append(
                     {
                         'business_id': review.get("business_id"),
@@ -75,8 +78,8 @@ def extract():
                         'date': review.get("date"),
                         'stars': review.get("stars"),
                         'text': text,
-                        'p': pn['p'],
-                        'n': pn['n']
+                        # 'p': pn['p'],
+                        # 'n': pn['n']
                     }
                 )
                 end = time.perf_counter()
@@ -98,6 +101,7 @@ def extract():
 
 
 def sentiment(des, cats):
+    qwen3 = None
     content = qwen3.generate_text(Template("""
 You are a sentiment classification assistant.
 

@@ -4,7 +4,7 @@ import logging
 from tqdm import tqdm
 from sentence_transformers import SentenceTransformer
 
-from exp.config import YELP_DATA_REVIEW, YELP_DATA_USER
+from exp.config import YELP_DATA_REVIEW, YELP_DATA_USER, YELP_DATA_BUSINESS_WSL
 from exp.data.yelp.user.hyperedge import HypergraphConstructor
 
 # 配置日志
@@ -24,7 +24,7 @@ def generate_semantic_embeddings(output_path='semantic_init.pt', embed_dim=128):
     # 2. 准备数据源
     logging.info("构建超图以获取全量节点...")
     hyperedgesCon = HypergraphConstructor(
-        YELP_DATA_REVIEW / 'reviewed_business.jsonl',
+        YELP_DATA_BUSINESS_WSL / 'reviewed_business.jsonl',
         YELP_DATA_USER / 'user_interest.jsonl',
         'zone_node.json'
     )
